@@ -1,0 +1,134 @@
+pipeline {
+    agent any
+
+    environment {
+        // GitHub PAT
+        GITHUB_PAT = credentials('github-pat')
+
+        // Salesforce DEV Org
+        SF_DEV_USER      = credentials('sf-dev-username')
+        SF_CLIENT_ID_DEV = credentials('sf-client-id-dev')
+        SF_DEV_KEY       = credentials('sf-dev-jwt-key')
+
+        // Salesforce INT Org
+        SF_INT_USER      = credentials('sf-int-username')
+        SF_CLIENT_ID_INT = credentials('sf-client-id-int')
+        // Remove SF_INT_KEY from environment; we'll use File Credential instead
+    }
+
+    stages {
+
+        stage('Check Node & NPM') {
+            steps {
+                withEnv(['PATH=C:\\Program Files\\nodejs;C:\\Program Files\\sf\\bin;%PATH%']) {
+                    bat """
+                        echo 📌 Checking Node.js and npm...
+                        node -v
+                        npm -v
+                    """
+                }
+            }
+        }
+
+        stage('Checkout Dev Branch') {
+            steps {
+                checkout([$class: 'GitSCM',
+                    branches: [[name: 'dev']],
+                    userRemoteConfigs: [[
+                        url: 'https://github.com/yallakka123/vsjenkinsdevops',
+                        credentialsId: 'github-pat'
+                    ]]
+                ])
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                withEnv(['PATH=C:\\Program Files\\nodejs;C:\\Program Files\\sf\\bin;%PATH%']) {
+                    bat """
+                        echo 📦 Installing Salesforce CLI and sfdx-git-delta...
+                        npm install -g --force @salesforce/cli
+                        npm install -g sfdx-git-delta
+                    """
+                }
+            }
+        }
+
+        stage('Authenticate Salesforce Orgs') {
+            steps {
+                withEnv(['PATH=C:\\Program Files\\nodejs;C:\\Program Files\\sf\\bin;%PATH%']) {
+                    bat """
+                        REM Authenticate DEV Org
+                        sfdx auth:jwt:grant --client-id %SF_CLIENT_ID_DEV% --username %SF_DEV_USER% --jwt-key-file %SF_DEV_KEY% --instance-url https://login.salesforce.com -a devOrg
+                    """
+                }
+            }
+        }
+
+        stage('Generate Delta Package with SGD') {
+            steps {
+                bat """
+                    echo ⚡ Generating delta package with sfdx-git-delta...
+                    git fetch origin
+                    git branch -D intBranch 2>nul || echo Branch not exists
+                    git checkout -b intBranch origin/int
+
+                    sgd --from "origin/int" --to HEAD --output delta
+
+                    echo ✅ Delta package generated
+                    dir delta /s
+
+                    if not exist delta\\package\\package.xml (
+                        echo ⚠ No changes detected between dev and int, skipping deployment.
+                        exit /b 0
+                    )
+                """
+            }
+        }
+
+        stage('Validate Deployment (Run Tests)') {
+            steps {
+                withEnv(['PATH=C:\\Program Files\\nodejs;C:\\Program Files\\sf\\bin;%PATH%']) {
+                    bat """
+                        echo 🔎 Validating deployment on INT Org with tests...
+                        sfdx force:source:deploy ^
+                          -u intOrg ^
+                          -x delta/package/package.xml ^
+                          --checkonly ^
+                          --testlevel RunLocalTests ^
+                          --json > result.json || exit /b 0
+                    """
+                }
+            }
+        }
+
+        stage('Deploy to INT Org (if Validation Passed)') {
+            steps {
+                withCredentials([file(credentialsId: 'int-key-file', variable: 'INT_KEY_FILE')]) {
+                    withEnv(['PATH=C:\\Program Files\\nodejs;C:\\Program Files\\sf\\bin;%PATH%']) {
+                        bat """
+                            echo ✅ Validation passed. Deploying to INT Org...
+
+                            REM Authenticate INT Org
+                            sfdx auth:jwt:grant ^
+                                --client-id %SF_CLIENT_ID_INT% ^
+                                --username %SF_INT_USER% ^
+                                --jwt-key-file %INT_KEY_FILE% ^
+                                --instance-url https://login.salesforce.com ^
+                                -a intOrg
+
+                            REM Deploy to INT Org
+                            sfdx force:source:deploy ^
+                                -u intOrg ^
+                                -x delta/package/package.xml ^
+                                --testlevel RunLocalTests ^
+                                --json
+                        """
+                    }
+                }
+            }
+        }
+
+
+    } // end stages
+} // end pipeline
